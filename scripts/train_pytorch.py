@@ -146,6 +146,37 @@ def get_model_parameters(model):
     )
 
 
+def freeze_pytorch_vision_and_language_encoders(model):
+    """Freeze PaliGemma vision and language encoders for PyTorch fine-tuning."""
+    model_to_freeze = (
+        model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    )
+    targets = (
+        ("vision_tower", model_to_freeze.paligemma_with_expert.paligemma.vision_tower),
+        ("language_model", model_to_freeze.paligemma_with_expert.paligemma.language_model),
+    )
+
+    frozen_tensors = 0
+    frozen_params = 0
+    for module_name, module in targets:
+        module_tensors = 0
+        module_params = 0
+        for param in module.parameters():
+            module_tensors += 1
+            module_params += param.numel()
+            param.requires_grad_(False)
+        frozen_tensors += module_tensors
+        frozen_params += module_params
+        logging.info(f"Frozen {module_name}: {module_tensors} tensors, {module_params:,} parameters")
+
+    total_params = sum(param.numel() for param in model_to_freeze.parameters())
+    trainable_params = sum(param.numel() for param in model_to_freeze.parameters() if param.requires_grad)
+    logging.info(
+        f"PyTorch trainable parameters after freezing: {trainable_params:,} / {total_params:,} "
+        f"(frozen encoder params: {frozen_params:,} in {frozen_tensors} tensors)"
+    )
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
@@ -408,6 +439,9 @@ def train_loop(config: _config.TrainConfig):
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
+    if getattr(model_cfg, "pi05", False):
+        freeze_pytorch_vision_and_language_encoders(model)
+
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
         model.gradient_checkpointing_enable()
@@ -455,8 +489,11 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    trainable_parameters = [param for param in model.parameters() if param.requires_grad]
+    if is_main:
+        logging.info(f"Optimizer will update {sum(param.numel() for param in trainable_parameters):,} parameters")
     optim = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -543,7 +580,7 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
             optim.step()

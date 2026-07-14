@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.piper_policy as piper_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -347,6 +348,54 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotPiperDataConfig(DataConfigFactory):
+    """
+    Piper 机械臂数据配置。
+
+    Piper 数据中的动作是绝对关节角度，需要用 DeltaActions 转换为 delta 动作。
+    6 个关节全部做 delta 转换（无夹爪）。
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # 数据集 key → 推理环境 key 映射
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[piper_policy.PiperInputs(model_type=model_config.model_type)],
+            outputs=[piper_policy.PiperOutputs()],
+        )
+
+        # 前 6 个关节做 delta，第 7 个夹爪保持 absolute
+        delta_action_mask = _transforms.make_bool_mask(6, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -760,6 +809,34 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_piper",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=25, discrete_state_input=True),
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/nvme2/houjunyi/vla_piper_lerobot/v01",  # v0+v1 合并
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=56,       # 7 GPU DDP，每卡 batch 8
+        num_workers=4,
+        log_interval=10,      # 每10步在wandb记录一次loss
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=250,
+            peak_lr=3e-5,
+            decay_steps=5_000,
+            decay_lr=3e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        # 冻结除 action expert 之外的所有参数（含图像编码器 SigLIP、语言模型 Gemma）
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # PyTorch 训练走 pytorch_weight_path 加载 modelscope 本地模型
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        pytorch_weight_path="/home/wufan/.cache/modelscope/models/lerobot--pi05_base/snapshots/master",
+        num_train_steps=5_000,
+        save_interval=1000,
     ),
     #
     # Fine-tuning Aloha configs.
